@@ -260,6 +260,11 @@ class SFTP extends SSH2
     var $requestBuffer = array();
 
     /**
+     * Offsets of handles in use
+     */
+    var $hoffsets = array();
+
+    /**
      * Default Constructor.
      *
      * Connects to an SFTP server
@@ -410,7 +415,6 @@ class SFTP extends SSH2
     function login($username)
     {
         $args = func_get_args();
-        $this->auth[] = $args;
         if (!call_user_func_array(array(&$this, '_login'), $args)) {
             return false;
         }
@@ -843,7 +847,6 @@ class SFTP extends SSH2
             }
             if (is_array($this->_query_stat_cache($this->_realpath($dir . '/' . $value)))) {
                 $temp = $this->_nlist_helper($dir . '/' . $value, true, $relativeDir . $value . '/');
-                $temp = is_array($temp) ? $temp : array();
                 $result = array_merge($result, $temp);
             } else {
                 $result[] = $relativeDir . $value;
@@ -1874,6 +1877,99 @@ class SFTP extends SSH2
         return true;
     }
 
+    function open($remote_file, $flags) {
+        if (!($this->bitmap & SSH2::MASK_LOGIN)) {
+            return false;
+        }
+
+        if ($flags & NET_SFTP_OPEN_WRITE) {
+            $remote_file = $this->_realpath($remote_file);
+            if ($remote_file === false) {
+                return false;
+            }
+
+            $this->_remove_from_stat_cache($remote_file);
+        }
+
+        $packet = pack('Na*N2', strlen($remote_file), $remote_file, $flags, 0);
+        if (!$this->_send_sftp_packet(NET_SFTP_OPEN, $packet)) {
+            return false;
+        }
+
+        $response = $this->_get_sftp_packet();
+        switch ($this->packet_type) {
+            case NET_SFTP_HANDLE:
+                $handle = substr($response, 4);
+                break;
+            case NET_SFTP_STATUS:
+                $this->_logError($response);
+                return false;
+            default:
+                user_error('Expected SSH_FXP_HANDLE or SSH_FXP_STATUS');
+                return false;
+        }
+        $this->hoffsets[$handle] = 0;
+
+        return ($handle);
+    }
+
+    function read($handle, $len, $offset = FALSE) {
+        if ($offset === FALSE)
+            $offset = $this->hoffsets[$handle];
+        $sftp_packet_size = 16384; // PuTTY uses 4096
+        $sftp_packet_size-= strlen($handle) + 25;
+        $content = '';
+
+        while ($len > 0) {
+            $packet_size = $len;
+            if ($packet_size > $sftp_packet_size)
+                $packet_size = $sftp_packet_size;
+            $packet = pack('Na*N3', strlen($handle), $handle, $offset / 4294967296, $offset, $packet_size);
+            if (!$this->_send_sftp_packet(NET_SFTP_READ, $packet, 0)) {
+                return false;
+            }
+            $response = $this->_get_sftp_packet($packets_sent - $i);
+
+            switch ($this->packet_type) {
+            case NET_SFTP_DATA:
+                $temp = substr($response, 4);
+                $offset += strlen($temp);
+                $len -= strlen($temp);
+                $content .= $temp;
+                break;
+            case NET_SFTP_STATUS:
+                $this->_logError($response);
+                if (strlen($content) == 0)
+                    return false;
+                $len = 0;
+                break;
+            default:
+                return (FALSE);
+            }
+        }
+        $this->hoffsets[$handle] = $offset;
+        return $content;
+    }
+
+    function write($handle, $data, $offset = FALSE) {
+        if ($offset === FALSE)
+            $offset = $this->hoffsets[$handle];
+        $packet = pack('Na*N3a*', strlen($handle), $handle, $offset / 4294967296, $offset, strlen($data), $data);
+        if (!$this->_send_sftp_packet(NET_SFTP_WRITE, $packet)) {
+            return false;
+        }
+        if (!$this->_read_put_responses(1)) {
+            return false;
+        }
+        $this->hoffsets[$handle] = $offset + strlen($data);
+        return true;
+    }
+
+    function close($handle) {
+        $this->hoffsets[$handle] = false;
+        return ($this->_close_handle($handle));
+    }
+
     /**
      * Uploads a file to the SFTP server.
      *
@@ -2149,11 +2245,10 @@ class SFTP extends SSH2
      * @param string $local_file
      * @param int $offset
      * @param int $length
-     * @param callable|null $progressCallback
      * @return mixed
      * @access public
      */
-    function get($remote_file, $local_file = false, $offset = 0, $length = -1, $progressCallback = null)
+    function get($remote_file, $local_file = false, $offset = 0, $length = -1)
     {
         if (!($this->bitmap & SSH2::MASK_LOGIN)) {
             return false;
@@ -2219,9 +2314,6 @@ class SFTP extends SSH2
                 }
                 $packet = null;
                 $read+= $packet_size;
-                if (is_callable($progressCallback)) {
-                    call_user_func($progressCallback, $read);
-                }
                 $i++;
             }
 
@@ -2977,20 +3069,6 @@ class SFTP extends SSH2
     }
 
     /**
-     * Resets a connection for re-use
-     *
-     * @param int $reason
-     * @access private
-     */
-    function _reset_connection($reason)
-    {
-        parent::_reset_connection($reason);
-        $this->use_request_id = false;
-        $this->pwd = false;
-        $this->requestBuffer = array();
-    }
-
-    /**
      * Receives SFTP Packets
      *
      * See '6. General Packet Format' of draft-ietf-secsh-filexfer-13 for more info.
@@ -3012,9 +3090,7 @@ class SFTP extends SSH2
             return $temp;
         }
 
-        // in SSH2.php the timeout is cumulative per function call. eg. exec() will
-        // timeout after 10s. but for SFTP.php it's cumulative per packet
-        $this->curTimeout = $this->timeout;
+        $this->curTimeout = false;
 
         $start = strtok(microtime(), ' ') + strtok(''); // http://php.net/microtime#61838
 
@@ -3034,13 +3110,6 @@ class SFTP extends SSH2
         extract(unpack('Nlength', $this->_string_shift($this->packet_buffer, 4)));
         $tempLength = $length;
         $tempLength-= strlen($this->packet_buffer);
-
-
-        // 256 * 1024 is what SFTP_MAX_MSG_LENGTH is set to in OpenSSH's sftp-common.h
-        if ($tempLength > 256 * 1024) {
-            user_error('Invalid SFTP packet size');
-            return false;
-        }
 
         // SFTP packet type and data payload
         while ($tempLength > 0) {

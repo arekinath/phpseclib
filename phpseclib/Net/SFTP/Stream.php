@@ -46,6 +46,8 @@ class Stream
      */
     var $sftp;
 
+    var $handle;
+
     /**
      * Path
      *
@@ -289,6 +291,20 @@ class Stream
 
         $this->pos = $this->mode[0] != 'a' ? 0 : $this->size;
 
+        $this->handle = false;
+        switch ($this->mode) {
+        case 'r':
+            $this->handle = $this->sftp->open($this->path, NET_SFTP_OPEN_READ);
+            break;
+        case 'w':
+        case 'x':
+        case 'c':
+            $this->handle = $this->sftp->open($this->path, NET_SFTP_OPEN_WRITE | NET_SFTP_OPEN_CREATE);
+            break;
+        }
+        if ($this->handle === false)
+            return false;
+
         return true;
     }
 
@@ -309,13 +325,7 @@ class Stream
                 return false;
         }
 
-        // commented out because some files - eg. /dev/urandom - will say their size is 0 when in fact it's kinda infinite
-        //if ($this->pos >= $this->size) {
-        //    $this->eof = true;
-        //    return false;
-        //}
-
-        $result = $this->sftp->get($this->path, false, $this->pos, $count);
+	$result = $this->sftp->read($this->handle, $count, $this->pos);
         if (isset($this->notification) && is_callable($this->notification)) {
             if ($result === false) {
                 call_user_func($this->notification, STREAM_NOTIFY_FAILURE, STREAM_NOTIFY_SEVERITY_ERR, $this->sftp->getLastSFTPError(), NET_SFTP_OPEN, 0, 0);
@@ -348,7 +358,7 @@ class Stream
                 return false;
         }
 
-        $result = $this->sftp->put($this->path, $data, SFTP::SOURCE_STRING, $this->pos);
+        $result = $this->sftp->write($this->handle, $data, $this->pos);
         if (isset($this->notification) && is_callable($this->notification)) {
             if (!$result) {
                 call_user_func($this->notification, STREAM_NOTIFY_FAILURE, STREAM_NOTIFY_SEVERITY_ERR, $this->sftp->getLastSFTPError(), NET_SFTP_OPEN, 0, 0);
@@ -756,6 +766,7 @@ class Stream
      */
     function _stream_close()
     {
+        $this->sftp->close($this->handle);
     }
 
     /**
